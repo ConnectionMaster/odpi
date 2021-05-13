@@ -4,8 +4,70 @@ ODPI-C Release notes
 Version 4.2 (TBD)
 -----------------
 
+#)  Added methods :func:`dpiPool_getMaxSessionsPerShard()`,
+    :func:`dpiPool_getPingInterval()`,
+    :func:`dpiPool_setMaxSessionsPerShard()`,
+    :func:`dpiPool_setPingInterval()` and :func:`dpiPool_reconfigure()` in
+    order to support changing pool configuration after the pool has been
+    created.
+#)  Added support for the SODA metadata cache available in Oracle Client
+    21.3 and higher (also available in Oracle Client 19 from 19.11). This
+    significantly improves the performance of repeated calls to methods
+    :func:`dpiSodaDb_createCollection()` (when not specifying a value
+    for the metadata parameter) and :func:`dpiSodaDb_openCollection()`. The
+    member :member:`dpiCommonCreateParams.sodaMetadataCache` has been added and
+    functions :func:`dpiPool_getSodaMetadataCache()` and
+    :func:`dpiPool_setSodaMetadataCache()` have been added.
+#)  Added support for supplying hints to SODA operations. The members
+    :member:`dpiSodaOperOptions.hint` and
+    :member:`dpiSodaOperOptions.hintLength` were added and methods
+    :func:`dpiSodaColl_insertOneWithOptions()`,
+    :func:`dpiSodaColl_insertManyWithOptions()` and
+    :func:`dpiSodaColl_saveWithOptions()` were added. These can only be used
+    with Oracle Client 21.3 and higher (also available in Oracle Client 19 from
+    19.11).
+#)  Added support for specifying the size of the statement cache when a pool or
+    standalone connection is created. The member
+    :member:`dpiCommonCreateParams.stmtCacheSize` was added and can be
+    populated with the desired value prior to calling :func:`dpiPool_create()`
+    or :func:`dpiConn_create()`.
+#)  Added function :func:`dpiLob_getType()` in order to get the type of a
+    LOB, as requested (`issue 135
+    <https://github.com/oracle/odpi/issues/135>`__).
 #)  Changed the requirement for the method :func:`dpiSodaColl_save()` to
     Oracle Client 19.9 or higher (instead of 20.1 or higher).
+#)  Added flag to internal calls made by method
+    :func:`dpiSodaColl_getDataGuide()` to ensure that the returned content
+    is in encoding UTF-8. This ensures consistency with other SODA documents
+    returned by ODPI-C.
+#)  Corrected internal handling of flags sent to
+    :func:`dpiSodaDocCursor_getNext()` and :func:`dpiSodaCollCursor_getNext()`.
+#)  The distributed transaction handle assosciated with the connection is now
+    cleared on commit or rollback (`cx_Oracle issue 530
+    <https://github.com/oracle/python-cx_Oracle/issues/530>`__).
+#)  When calling :func:`dpiJson_getValue()`, clear any cached value before
+    getting the new value in order to take into account possible calls to
+    :func:`dpiJson_setValue()` that were made in between or to take into
+    account the passing of different flags (`issue 154
+    <https://github.com/oracle/odpi/issues/154>`__).
+#)  Corrected internal handling of client version information when creating
+    multiple contexts (`issue 156
+    <https://github.com/oracle/odpi/issues/156>`__).
+#)  Threaded mode is now always enabled when creating pools, regardless of what
+    mode is provided in the :member:`dpiCommonCreateParams.createMode` member
+    in order to provide for greater safety. Although there may be instances
+    where threaded mode is not strictly needed, these are few and any
+    advantages are minimal.
+#)  Improved dead connection detection. If any error occurs that indicates that
+    the connection is no longer usable, the connection is marked as dead and
+    the unified error `DPI-1080: connection was closed by ORA-%d` (where the
+    `%d` is replaced by the Oracle error that caused the connection to be
+    closed) is returned instead. Attempts to use the connection after this
+    result in the error `DPI-1010: not connected` being returned. This includes
+    call timeout errors such as when :func:`dpiConn_setCallTimeout()` is called
+    with a value set too low to allow the connection to break the executing
+    statement and reset after the timeout occurs.
+#)  Improved documentation and the test suite.
 
 
 Version 4.1 (December 8, 2020)

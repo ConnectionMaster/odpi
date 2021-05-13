@@ -140,7 +140,7 @@ int dpiError__set(dpiError *error, const char *action, dpiErrorNum errorNum,
 int dpiError__setFromOCI(dpiError *error, int status, dpiConn *conn,
         const char *action)
 {
-    uint32_t callTimeout;
+    uint32_t callTimeout, serverStatus;
 
     // special error cases
     if (status == DPI_OCI_INVALID_HANDLE)
@@ -178,39 +178,64 @@ int dpiError__setFromOCI(dpiError *error, int status, dpiConn *conn,
             (void*) &error->buffer->isRecoverable, 0,
             DPI_OCI_ATTR_ERROR_IS_RECOVERABLE, NULL, error);
 
-    // check for certain errors which indicate that the session is dead and
-    // should be dropped from the session pool (if a session pool was used)
-    // also check for call timeout and raise unified message instead
+    // check the health of the connection (if one was specified in this call)
     if (conn && !conn->deadSession) {
-        switch (error->buffer->code) {
-            case    22: // invalid session ID; access denied
-            case    28: // your session has been killed
-            case    31: // your session has been marked for kill
-            case    45: // your session has been terminated with no replay
-            case   378: // buffer pools cannot be created as specified
-            case   602: // internal programming exception
-            case   603: // ORACLE server session terminated by fatal error
-            case   609: // could not attach to incoming connection
-            case  1012: // not logged on
-            case  1041: // internal error. hostdef extension doesn't exist
-            case  1043: // user side memory corruption
-            case  1089: // immediate shutdown or close in progress
-            case  1092: // ORACLE instance terminated. Disconnection forced
-            case  2396: // exceeded maximum idle time, please connect again
-            case  3113: // end-of-file on communication channel
-            case  3114: // not connected to ORACLE
-            case  3122: // attempt to close ORACLE-side window on user side
-            case  3135: // connection lost contact
-            case 12153: // TNS:not connected
-            case 12537: // TNS:connection closed
-            case 12547: // TNS:lost contact
-            case 12570: // TNS:packet reader failure
-            case 12583: // TNS:no reader
-            case 27146: // post/wait initialization failed
-            case 28511: // lost RPC connection
-            case 56600: // an illegal OCI function call was issued
+
+        // first check the attribute specifically designed to check the health
+        // of the connection, if possible
+        if (conn->serverHandle) {
+            if (dpiOci__attrGet(conn->serverHandle, DPI_OCI_HTYPE_SERVER,
+                    &serverStatus, NULL, DPI_OCI_ATTR_SERVER_STATUS,
+                    "get server status", error) < 0 ||
+                    serverStatus != DPI_OCI_SERVER_NORMAL) {
                 conn->deadSession = 1;
-                break;
+            }
+        }
+
+        // check for certain errors which indicate that the session is dead
+        if (!conn->deadSession) {
+            switch (error->buffer->code) {
+                case    22: // invalid session ID; access denied
+                case    28: // your session has been killed
+                case    31: // your session has been marked for kill
+                case    45: // your session has been terminated with no replay
+                case   378: // buffer pools cannot be created as specified
+                case   602: // internal programming exception
+                case   603: // ORACLE server session terminated by fatal error
+                case   609: // could not attach to incoming connection
+                case  1012: // not logged on
+                case  1041: // internal error. hostdef extension doesn't exist
+                case  1043: // user side memory corruption
+                case  1089: // immediate shutdown or close in progress
+                case  1092: // ORACLE instance terminated. Disconnection forced
+                case  2396: // exceeded maximum idle time, please connect again
+                case  3113: // end-of-file on communication channel
+                case  3114: // not connected to ORACLE
+                case  3122: // attempt to close ORACLE-side window on user side
+                case  3135: // connection lost contact
+                case 12153: // TNS:not connected
+                case 12537: // TNS:connection closed
+                case 12547: // TNS:lost contact
+                case 12570: // TNS:packet reader failure
+                case 12583: // TNS:no reader
+                case 27146: // post/wait initialization failed
+                case 28511: // lost RPC connection
+                case 56600: // an illegal OCI function call was issued
+                    conn->deadSession = 1;
+                    break;
+            }
+        }
+
+        // if session is marked as dead, return a unified error message
+        if (conn->deadSession) {
+            dpiError__set(error, action, DPI_ERR_CONN_CLOSED,
+                    error->buffer->code);
+            error->buffer->code = 0;
+            return DPI_FAILURE;
+        }
+
+        // check for call timeout and return a unified message instead
+        switch (error->buffer->code) {
             case  3136: // inbound connection timed out
             case  3156: // OCI call timed out
             case 12161: // TNS:internal error: partial data received
@@ -226,6 +251,7 @@ int dpiError__setFromOCI(dpiError *error, int status, dpiConn *conn,
                 }
                 break;
         }
+
     }
 
     return DPI_FAILURE;

@@ -12,7 +12,11 @@ the database.  All members are initialized to default values using the
     Specifies the mode used for creating connections. It is expected to be
     one or more of the values from the enumeration
     :ref:`dpiCreateMode<dpiCreateMode>`, OR'ed together. The default value is
-    DPI_MODE_CREATE_DEFAULT.
+    `DPI_MODE_CREATE_DEFAULT`.
+
+    Note that when this structure is used during creation of a pool, the mode
+    `DPI_MODE_CREATE_THREADED` is automatically enabled regardless of what
+    value is set in this member.
 
 .. member:: const char* dpiCommonCreateParams.encoding
 
@@ -62,3 +66,17 @@ the database.  All members are initialized to default values using the
     member, in bytes. The default value is the length of the member
     :member:`dpiContextCreateParams.defaultDriverName` specified when the call
     to :func:`dpiContext_createWithParams()` was made.
+
+.. member:: int dpiCommonCreateParams.sodaMetadataCache
+
+    Specifies whether to enable the SODA metadata cache or not, which can
+    significantly improve the performance of repeated calls to methods
+    :func:`dpiSodaDb_createCollection()` (when not specifying a value for the
+    metadata parameter) and :func:`dpiSodaDb_openCollection()`. This requires
+    Oracle Client 21.3 or higher (also available in Oracle Client 19 from
+    19.11).
+
+.. member:: uint32_t dpiCommonCreateParams.stmtCacheSize
+
+    Specifies the number of statements to retain in the statement cache. Use a
+    value of 0 to disable the statement cache completely.

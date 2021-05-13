@@ -1,5 +1,5 @@
 //-----------------------------------------------------------------------------
-// Copyright (c) 2016, 2019, Oracle and/or its affiliates. All rights reserved.
+// Copyright (c) 2016, 2021, Oracle and/or its affiliates. All rights reserved.
 // This program is free software: you can modify it and/or redistribute it
 // under the terms of:
 //
@@ -88,7 +88,8 @@ static int dpiConn__check(dpiConn *conn, const char *fnName, dpiError *error)
 //-----------------------------------------------------------------------------
 int dpiConn__checkConnected(dpiConn *conn, dpiError *error)
 {
-    if (!conn->handle || conn->closing || (conn->pool && !conn->pool->handle))
+    if (!conn->handle || conn->closing || conn->deadSession ||
+            (conn->pool && !conn->pool->handle))
         return dpiError__set(error, "check connected", DPI_ERR_NOT_CONNECTED);
     return DPI_SUCCESS;
 }
@@ -360,7 +361,7 @@ int dpiConn__create(dpiConn *conn, const dpiContext *context,
 
     // initialize environment (for non-pooled connections)
     if (!pool && dpiEnv__init(conn->env, context, commonParams, envHandle,
-            error) < 0)
+            commonParams->createMode, error) < 0)
         return DPI_FAILURE;
 
     // if a handle is specified, use it
@@ -470,7 +471,16 @@ static int dpiConn__createStandalone(dpiConn *conn, const char *userName,
     authMode = createParams->authMode | DPI_OCI_STMT_CACHE;
     if (dpiOci__sessionBegin(conn, credentialType, authMode, error) < 0)
         return DPI_FAILURE;
-    return dpiConn__getServerCharset(conn, error);
+    if (dpiConn__getServerCharset(conn, error) < 0)
+        return DPI_FAILURE;
+
+    // set the statement cache size
+    if (dpiOci__attrSet(conn->handle, DPI_OCI_HTYPE_SVCCTX,
+            (void*) &commonParams->stmtCacheSize, 0,
+            DPI_OCI_ATTR_STMTCACHESIZE, "set stmt cache size", error) < 0)
+        return DPI_FAILURE;
+
+    return DPI_SUCCESS;
 }
 
 
@@ -507,6 +517,10 @@ void dpiConn__free(dpiConn *conn, dpiError *error)
     if (conn->objects) {
         dpiHandleList__free(conn->objects);
         conn->objects = NULL;
+    }
+    if (conn->transactionHandle) {
+        dpiOci__handleFree(conn->transactionHandle, DPI_OCI_HTYPE_TRANS);
+        conn->transactionHandle = NULL;
     }
     dpiUtils__freeMemory(conn);
 }
@@ -776,18 +790,33 @@ static int dpiConn__getSession(dpiConn *conn, uint32_t mode,
         if (dpiConn__getHandles(conn, error) < 0)
             return DPI_FAILURE;
 
-        // get last time used from session context
+        // for standalone connections, nothing more needs to be done
+        if (!conn->pool) {
+            params->outNewSession = 1;
+            break;
+        }
+
+        // remainder of the loop is for pooled connections only; get last time
+        // used from session context; if value is not found, a new connection
+        // has been created and there is no need to perform a ping
         lastTimeUsed = NULL;
         if (dpiOci__contextGetValue(conn, DPI_CONTEXT_LAST_TIME_USED,
                 (uint32_t) (sizeof(DPI_CONTEXT_LAST_TIME_USED) - 1),
                 (void**) &lastTimeUsed, 1, error) < 0)
             return DPI_FAILURE;
-
-        // if value is not found, a new connection has been created and there
-        // is no need to perform a ping; nor if we are creating a standalone
-        // connection
-        if (!lastTimeUsed || !conn->pool) {
+        if (!lastTimeUsed) {
             params->outNewSession = 1;
+
+            // for pooled connections, set the statement cache size; when a
+            // pool is created, the minSessions value is used to create
+            // connections and these use the default statement cache size, not
+            // the statement cache size specified for the pool; setting the
+            // value here eliminates that discrepancy
+            if (dpiOci__attrSet(conn->handle, DPI_OCI_HTYPE_SVCCTX,
+                    &conn->pool->stmtCacheSize, 0, DPI_OCI_ATTR_STMTCACHESIZE,
+                    "set stmt cache size", error) < 0)
+                return DPI_FAILURE;
+
             break;
         }
 
@@ -798,7 +827,8 @@ static int dpiConn__getSession(dpiConn *conn, uint32_t mode,
             break;
 
         // ping needs to be done at this point; set parameters to ensure that
-        // the ping does not take too long to complete; keep original values
+        // the ping does not take too long to complete; keep original values so
+        // that they can be restored after the ping is completed
         dpiOci__attrGet(conn->serverHandle,
                 DPI_OCI_HTYPE_SERVER, &savedTimeout, NULL,
                 DPI_OCI_ATTR_RECEIVE_TIMEOUT, NULL, error);
@@ -815,7 +845,7 @@ static int dpiConn__getSession(dpiConn *conn, uint32_t mode,
                     NULL, error);
         }
 
-        // if ping is successful, the connection is valid and can be returned
+        // if ping is successful, the connection is valid and can be returned;
         // restore original network parameters
         if (dpiOci__ping(conn, error) == 0) {
             dpiOci__attrSet(conn->serverHandle, DPI_OCI_HTYPE_SERVER,
@@ -1227,7 +1257,6 @@ int dpiConn_beginDistribTrans(dpiConn *conn, long formatId,
         const char *transactionId, uint32_t transactionIdLength,
         const char *branchId, uint32_t branchIdLength)
 {
-    void *transactionHandle;
     dpiError error;
     dpiOciXID xid;
     int status;
@@ -1250,28 +1279,18 @@ int dpiConn_beginDistribTrans(dpiConn *conn, long formatId,
         return dpiGen__endPublicFn(conn, DPI_FAILURE, &error);
     }
 
-    // determine if a transaction handle was previously allocated
-    if (dpiOci__attrGet(conn->handle, DPI_OCI_HTYPE_SVCCTX,
-            (void*) &transactionHandle, NULL, DPI_OCI_ATTR_TRANS,
-            "get transaction handle", &error) < 0)
-        return dpiGen__endPublicFn(conn, DPI_FAILURE, &error);
-
-    // if one was not found, create one and associate it with the connection
-    if (!transactionHandle) {
-
-        // create new handle
-        if (dpiOci__handleAlloc(conn->env->handle, &transactionHandle,
+    // if a transaction handle does not exist, create one
+    if (!conn->transactionHandle) {
+        if (dpiOci__handleAlloc(conn->env->handle, &conn->transactionHandle,
                 DPI_OCI_HTYPE_TRANS, "create transaction handle", &error) < 0)
             return dpiGen__endPublicFn(conn, DPI_FAILURE, &error);
+    }
 
-        // associate the transaction with the connection
-        if (dpiOci__attrSet(conn->handle, DPI_OCI_HTYPE_SVCCTX,
-                transactionHandle, 0, DPI_OCI_ATTR_TRANS,
-                "associate transaction", &error) < 0) {
-            dpiOci__handleFree(transactionHandle, DPI_OCI_HTYPE_TRANS);
-            return dpiGen__endPublicFn(conn, DPI_FAILURE, &error);
-        }
-
+    // associate the transaction with the connection
+    if (dpiOci__attrSet(conn->handle, DPI_OCI_HTYPE_SVCCTX,
+            conn->transactionHandle, 0, DPI_OCI_ATTR_TRANS,
+            "associate transaction", &error) < 0) {
+        return dpiGen__endPublicFn(conn, DPI_FAILURE, &error);
     }
 
     // set the XID for the transaction, if applicable
@@ -1283,7 +1302,7 @@ int dpiConn_beginDistribTrans(dpiConn *conn, long formatId,
             strncpy(xid.data, transactionId, transactionIdLength);
         if (branchIdLength > 0)
             strncpy(&xid.data[transactionIdLength], branchId, branchIdLength);
-        if (dpiOci__attrSet(transactionHandle, DPI_OCI_HTYPE_TRANS, &xid,
+        if (dpiOci__attrSet(conn->transactionHandle, DPI_OCI_HTYPE_TRANS, &xid,
                 sizeof(dpiOciXID), DPI_OCI_ATTR_XID, "set XID", &error) < 0)
             return dpiGen__endPublicFn(conn, DPI_FAILURE, &error);
     }
@@ -1346,8 +1365,13 @@ int dpiConn_close(dpiConn *conn, dpiConnCloseMode mode, const char *tag,
     int closing;
 
     // validate parameters
-    if (dpiConn__check(conn, __func__, &error) < 0)
+    if (dpiGen__startPublicFn(conn, DPI_HTYPE_CONN, __func__, &error) < 0)
+        return DPI_FAILURE;
+    if (!conn->handle || conn->closing ||
+            (conn->pool && !conn->pool->handle)) {
+        dpiError__set(&error, "check connected", DPI_ERR_NOT_CONNECTED);
         return dpiGen__endPublicFn(conn, DPI_FAILURE, &error);
+    }
     DPI_CHECK_PTR_AND_LENGTH(conn, tag)
     if (mode && !conn->pool) {
         dpiError__set(&error, "check in pool", DPI_ERR_CONN_NOT_IN_POOL);
@@ -1403,6 +1427,12 @@ int dpiConn_commit(dpiConn *conn)
         return dpiGen__endPublicFn(conn, DPI_FAILURE, &error);
     if (dpiOci__transCommit(conn, conn->commitMode, &error) < 0)
         return dpiGen__endPublicFn(conn, DPI_FAILURE, &error);
+    if (conn->transactionHandle) {
+        if (dpiOci__attrSet(conn->handle, DPI_OCI_HTYPE_SVCCTX, NULL, 0,
+                DPI_OCI_ATTR_TRANS, "clear transaction", &error) < 0)
+            return dpiGen__endPublicFn(conn, DPI_FAILURE, &error);
+    }
+
     conn->commitMode = DPI_OCI_DEFAULT;
     return dpiGen__endPublicFn(conn, DPI_SUCCESS, &error);
 }
@@ -2117,6 +2147,12 @@ int dpiConn_rollback(dpiConn *conn)
     if (dpiConn__check(conn, __func__, &error) < 0)
         return dpiGen__endPublicFn(conn, DPI_FAILURE, &error);
     status = dpiOci__transRollback(conn, 1, &error);
+    if (conn->transactionHandle) {
+        if (dpiOci__attrSet(conn->handle, DPI_OCI_HTYPE_SVCCTX, NULL, 0,
+                DPI_OCI_ATTR_TRANS, "clear transaction", &error) < 0)
+            return dpiGen__endPublicFn(conn, DPI_FAILURE, &error);
+    }
+
     return dpiGen__endPublicFn(conn, status, &error);
 }
 
